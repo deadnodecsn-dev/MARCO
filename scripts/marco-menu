@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# marco-menu v3: full-screen launcher for MARCO ROOT. Run it with: m
+# Needs fzf:  sudo apt install fzf
+
+# ---- Edit these if addresses change ----
+HOME_IP="192.168.1.11"        # HOME (Proxmox)
+NAS_IP="192.168.1.13"         # NAS Pi (static)
+MC_IP="192.168.1.12"          # marco-mc container
+GW_IP="192.168.1.1"            # gateway
+ROOT_IP="192.168.1.10"        # ROOT (Pi-hole DNS answers here)
+NAS_EXPORT="/mnt/marco-nas/shared"   # NFS export on the NAS
+NAS_MOUNT="/mnt/nas"            # where the NAS is mounted on ROOT
+MC_CT=100                       # marco-mc container ID on HOME
+HOME_HOST="carsonb@${HOME_IP}"
+NAS_HOST="carsonb@${NAS_IP}"
+SSH_Q="-o BatchMode=yes -o ConnectTimeout=5"
+
+if ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf is not installed. Run: sudo apt install fzf"
+    exit 1
+fi
+
+# Ctrl+C stops the running command, not the whole menu
+trap ':' INT
+
+pause() { echo; read -rp "Press Enter to return to the menu... " _; }
+
+confirm() {
+    read -rp "$1 Type yes: " ans
+    [ "$ans" = "yes" ]
+}
+
+dot() {
+    if ping -c1 -W1 "$1" >/dev/null 2>&1; then
+        printf '\033[32m●\033[0m'
+    else
+        printf '\033[31m●\033[0m'
+    fi
+}
+
+header() {
+    printf 'ROOT \033[32m●\033[0m   HOME %s   NAS %s   MC %s      Enter = run   Esc = shell   type to search' \
+        "$(dot "$HOME_IP")" "$(dot "$NAS_IP")" "$(dot "$MC_IP")"
+}
+
+updates_for() {   # $1 = label, $2 = host or "local"
+    if [ "$2" = "local" ]; then
+        n=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
+    else
+        n=$(ssh $SSH_Q "$2" "apt list --upgradable 2>/dev/null | grep -c upgradable" 2>/dev/null)
+    fi
+    printf '%-6s %s\n' "$1" "${n:-UNREACHABLE} package(s) can be upgraded"
+}
+
+ping_node() {     # $1 = label, $2 = ip
+    avg=$(ping -c3 -W1 "$2" 2>/dev/null | awk -F'/' '/^rtt/ {printf "%.1f ms", $5}')
+    printf '%-9s %-16s %s\n' "$1" "$2" "${avg:-DOWN}"
+}
+
+can_sudo() {   # $1 = user@host, $2 = full path of the command
+    ssh $SSH_Q "$1" "sudo -n $2 --help" >/dev/null 2>&1
+}
+
+full_reboot() {
+    echo "FULL REBOOT: NAS first, then HOME, then ROOT (this machine)."
+    echo "Minecraft players will be disconnected and your SSH session will drop."
+    echo
+    confirm "Reboot the whole system?" || { echo "Cancelled."; return; }
+    # ROOT reboots itself at the very end, so get its sudo password now, before anything goes down
+    if ! sudo -n /usr/sbin/reboot --help >/dev/null 2>&1; then
+        sudo -v || { echo "Need your sudo password for ROOT. Nothing was rebooted."; return; }
+    fi
+    echo
+    if ! ping -c1 -W1 "$NAS_IP" >/dev/null 2>&1; then
+        echo "NAS: not answering, skipped"
+    elif can_sudo "$NAS_HOST" /usr/sbin/reboot; then
+        ssh $SSH_Q "$NAS_HOST" "sudo -n reboot" >/dev/null 2>&1
+        echo "NAS: reboot sent, checking that it goes down..."
+        went_down=0
+        for _ in $(seq 1 20); do
+            ping -c1 -W1 "$NAS_IP" >/dev/null 2>&1 || { went_down=1; break; }
+            sleep 2
+        done
+        if [ "$went_down" = 1 ]; then
+            echo "NAS: went offline, rebooting now"
+        else
+            echo "NAS: still answering after about a minute, the reboot may not have worked"
+        fi
+    else
+        echo "NAS: sudo wants a password for reboot, skipped (fix the NAS sudo rule)"
+    fi
+    echo "Handing over to marco-reboot (HOME, then ROOT)..."
+    "$HOME/marco-reboot"
+}
+
+full_poweroff() {
+    echo "FULL POWER OFF: NAS first, then HOME, then ROOT (this machine)."
+    echo "Nothing can turn them back on remotely. You will have to replug the NAS,"
+    echo "press HOME's power button and replug ROOT's USB-C power."
+    echo
+    if ! ssh $SSH_Q "$HOME_HOST" "sudo -n /usr/sbin/poweroff --help" >/dev/null 2>&1; then
+        echo "HOME is not set up for passwordless poweroff yet (see the marco-menu note)."
+        echo "Nothing was shut down."
+        return
+    fi
+    nas_up=0
+    if ping -c1 -W1 "$NAS_IP" >/dev/null 2>&1; then
+        nas_up=1
+        if ! can_sudo "$NAS_HOST" /usr/sbin/poweroff; then
+            echo "The NAS is not set up for passwordless poweroff yet (see the marco-menu note)."
+            echo "Nothing was shut down."
+            return
+        fi
+    fi
+    sudo -v || { echo "Need your sudo password for ROOT. Nothing was shut down."; return; }
+    read -rp "Type POWER OFF to continue: " ans
+    [ "$ans" = "POWER OFF" ] || { echo "Cancelled."; return; }
+    echo
+    if [ "$nas_up" = 1 ]; then
+        ssh $SSH_Q "$NAS_HOST" "sudo -n poweroff" >/dev/null 2>&1
+        echo "NAS: shutdown sent"
+    else
+        echo "NAS: not answering, skipped"
+    fi
+    ssh $SSH_Q "$HOME_HOST" "sudo -n poweroff" >/dev/null 2>&1
+    echo "HOME: shutdown sent (Proxmox stops the Minecraft container first, up to a few minutes)"
+    echo "Waiting for HOME to go offline..."
+    for _ in $(seq 1 48); do
+        ping -c1 -W1 "$HOME_IP" >/dev/null 2>&1 || break
+        sleep 5
+    done
+    if ping -c1 -W1 "$HOME_IP" >/dev/null 2>&1; then
+        echo "HOME is still answering. ROOT stays on. Check HOME before powering anything else off."
+        return
+    fi
+    echo "HOME is off. Powering off ROOT in 10 seconds. Press Ctrl+C to cancel."
+    sleep 10 || { echo "Cancelled. ROOT stays on."; return; }
+    sudo poweroff
+}
+
+nas_mount() {
+    if mountpoint -q "$NAS_MOUNT"; then
+        echo "The NAS is already mounted at $NAS_MOUNT"
+    else
+        if ! command -v mount.nfs4 >/dev/null 2>&1 && [ ! -x /sbin/mount.nfs4 ]; then
+            echo "nfs-common is not installed. Run: sudo apt install nfs-common"
+            return
+        fi
+        sudo mkdir -p "$NAS_MOUNT"
+        sudo mount -t nfs4 "$NAS_IP:$NAS_EXPORT" "$NAS_MOUNT" && echo "Mounted $NAS_IP:$NAS_EXPORT at $NAS_MOUNT" || echo "Mount failed. Is the NAS up? Is nfs-server running there?"
+    fi
+    echo; df -h "$NAS_MOUNT" 2>/dev/null
+}
+
+nas_unmount() {
+    if mountpoint -q "$NAS_MOUNT"; then
+        sudo umount "$NAS_MOUNT" && echo "Unmounted $NAS_MOUNT" || echo "Could not unmount (something is using it? cd out of $NAS_MOUNT first)"
+    else
+        echo "The NAS is not mounted at $NAS_MOUNT"
+    fi
+}
+
+dns_test() {
+    if ! command -v nslookup >/dev/null 2>&1; then
+        echo "nslookup is not installed. Run: sudo apt install dnsutils"
+        return
+    fi
+    out=$(nslookup -timeout=3 -retry=1 google.com "$ROOT_IP" 2>&1)
+    if echo "$out" | grep -q '^Name:'; then
+        printf '\033[32mOK\033[0m   Pi-hole (%s) answered a lookup for google.com\n' "$ROOT_IP"
+    else
+        printf '\033[31mFAIL\033[0m Pi-hole (%s) did not answer\n' "$ROOT_IP"
+        echo "$out" | head -5
+    fi
+    echo
+    docker ps -a --filter name=pihole --format 'table {{.Names}}\t{{.Status}}'
+}
+
+firewall_all() {
+    echo "== ROOT (UFW) =="
+    sudo ufw status numbered
+    echo
+    echo "== HOME (Proxmox firewall) =="
+    ssh -t "$HOME_HOST" "sudo pve-firewall status" 2>/dev/null || echo "HOME: could not read the firewall status"
+    echo
+    echo "== NAS (UFW) =="
+    ssh -t "$NAS_HOST" "sudo ufw status numbered" 2>/dev/null || echo "NAS: could not read the firewall status"
+}
+
+T=$'\t'
+ENTRIES=$(cat <<EOF
+Monitor: Full status${T}Full health report for ROOT, HOME, NAS, Docker and the network.
+Monitor: Short status${T}The quick report: who is online and how long they have been up.
+Monitor: htop (ROOT)${T}Live CPU, memory and process view for ROOT. Press q to come back.
+Monitor: htop (HOME)${T}Live CPU, memory and process view for the Proxmox host. Press q to come back.
+Monitor: htop (NAS)${T}Live CPU, memory and process view for marco-nas. Press q to come back.
+Monitor: Uptime Kuma${T}Is Uptime Kuma running on ROOT? Shows its status and the last 30 log lines.
+Monitor: Pi-hole DNS test${T}Asks ROOT's Pi-hole to look up google.com and shows OK or FAIL, plus the container status.
+Monitor: Docker containers${T}Every container on ROOT with its state and ports.
+Monitor: Docker logs${T}Pick a container on ROOT and follow its log. Ctrl+C returns here.
+Monitor: Disk space${T}Free space on ROOT, HOME and the NAS.
+Monitor: Updates available${T}How many packages are waiting for an upgrade on each machine.
+Network: Ping all nodes${T}Latency to HOME, NAS, marco-mc, the gateway and the internet.
+Network: Tailscale status${T}Which machines are on the tailnet and how they connect.
+Network: Firewall (UFW)${T}ROOT's firewall rules. Asks for your sudo password.
+Network: Firewall status (all)${T}Firewall state on ROOT (UFW), HOME (Proxmox firewall) and the NAS (UFW). Asks for the sudo password on each machine.
+Network: Dashboard links${T}All the MARCO web pages, as Tailscale addresses you can open from anywhere.
+Storage: Mount NAS (NFS)${T}Mounts the NAS share at /mnt/nas on ROOT over NFS. Asks for your sudo password.
+Storage: Unmount NAS (NFS)${T}Unmounts /mnt/nas. Make sure you are not inside it.
+Shell: HOME${T}Open a shell on the Proxmox host. Type exit to come back.
+Shell: marco-mc${T}Open a shell inside the Minecraft container (runs sudo pct enter on HOME).
+Shell: NAS${T}Open a shell on marco-nas. Type exit to come back.
+Minecraft: Crafty service${T}Is Crafty running inside the Minecraft container?
+Minecraft: Backups${T}The newest Minecraft backups on HOME.
+Proxmox: Containers and VMs${T}pct list and qm list on HOME.
+Power: FULL reboot${T}Reboots the NAS, then HOME, then ROOT (runs marco-reboot for the last two). Asks you to type yes.
+Power: FULL power off${T}Shuts down the NAS, then HOME, then ROOT. Nothing can turn them back on remotely. Asks you to type POWER OFF.
+To shell${T}Leave the menu and use a normal ROOT prompt.
+Quit${T}Leave the menu and log out of ROOT (closes this SSH session).
+EOF
+)
+
+while true; do
+    choice=$(printf '%s\n' "$ENTRIES" |
+        fzf --ansi --delimiter="$T" --with-nth=1 \
+            --height=100% --layout=reverse --border=rounded --cycle --no-info \
+            --border-label=' M A R C O ' --color='label:bold,border:cyan' \
+            --prompt='MARCO > ' --header="$(header)" \
+            --preview='printf "%s\n" {2}' \
+            --preview-window='right,45%,wrap,<90(down,5,wrap)') || exit 0
+
+    label=${choice%%$'\t'*}
+    clear
+
+    case "$label" in
+        "Monitor: Full status")      "$HOME/marco-status"; pause ;;
+        "Monitor: Short status")     "$HOME/marco-status-short"; pause ;;
+        "Monitor: htop (ROOT)")
+            if command -v htop >/dev/null 2>&1; then htop; else echo "htop is not installed on ROOT. Run: sudo apt install htop"; pause; fi ;;
+        "Monitor: htop (HOME)")
+            ssh -t "$HOME_HOST" 'if command -v htop >/dev/null 2>&1; then htop; else echo "htop is not installed on HOME. Run: sudo apt install htop"; read -rp "Press Enter... " _; fi' ;;
+        "Monitor: htop (NAS)")
+            ssh -t "$NAS_HOST" 'if command -v htop >/dev/null 2>&1; then htop; else echo "htop is not installed on the NAS. Run: sudo apt install htop"; read -rp "Press Enter... " _; fi' ;;
+        "Monitor: Uptime Kuma")
+            docker ps -a --filter name=uptime-kuma --format 'table {{.Names}}\t{{.Status}}'
+            echo; docker logs --tail 30 uptime-kuma 2>&1
+            pause ;;
+        "Monitor: Pi-hole DNS test")   dns_test; pause ;;
+        "Monitor: Docker containers")
+            docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'; pause ;;
+        "Monitor: Docker logs")
+            c=$(docker ps -a --format '{{.Names}}' | fzf --height=40% --layout=reverse --border=rounded --prompt='Container > ') || continue
+            clear
+            docker logs --tail 100 -f "$c"
+            pause ;;
+        "Monitor: Disk space")
+            echo "== ROOT =="; df -h -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null
+            echo; echo "== HOME =="; ssh $SSH_Q "$HOME_HOST" "df -h -x tmpfs -x devtmpfs -x squashfs" 2>/dev/null || echo "unreachable"
+            echo; echo "== NAS =="; ssh $SSH_Q "$NAS_HOST" "df -h -x tmpfs -x devtmpfs" 2>/dev/null || echo "unreachable"
+            pause ;;
+        "Monitor: Updates available")
+            echo "Checking (the NAS is slow, give it a moment)..."; echo
+            updates_for ROOT local
+            updates_for HOME "$HOME_HOST"
+            updates_for NAS  "$NAS_HOST"
+            echo; echo "Counts come from each machine's last 'apt update'. Nothing was installed."
+            pause ;;
+        "Network: Ping all nodes")
+            ping_node HOME "$HOME_IP"
+            ping_node NAS "$NAS_IP"
+            ping_node marco-mc "$MC_IP"
+            ping_node gateway "$GW_IP"
+            ping_node internet 1.1.1.1
+            pause ;;
+        "Network: Tailscale status")  tailscale status; pause ;;
+        "Network: Firewall (UFW)")    sudo ufw status verbose; pause ;;
+        "Network: Firewall status (all)") firewall_all; pause ;;
+        "Storage: Mount NAS (NFS)")   nas_mount; pause ;;
+        "Storage: Unmount NAS (NFS)") nas_unmount; pause ;;
+        "Network: Dashboard links")
+            cat <<'LINKS'
+Over Tailscale (works away from home):
+  Homarr      http://100.64.0.1:7575
+  Pi-hole     http://100.64.0.1:8053/admin
+  Portainer   https://100.64.0.1:9443
+  Glances     http://100.64.0.1:61208
+  Uptime Kuma http://100.64.0.1:3001
+  Proxmox     https://100.64.0.2:8006
+  Crafty      https://100.64.0.3:8443
+LINKS
+            pause ;;
+        "Shell: HOME")       ssh -t "$HOME_HOST" ;;
+        "Shell: marco-mc")   ssh -t "$HOME_HOST" "sudo pct enter $MC_CT" ;;
+        "Shell: NAS")        ssh -t "$NAS_HOST" ;;
+        "Minecraft: Crafty service")
+            ssh -t "$HOME_HOST" "sudo pct exec $MC_CT -- systemctl status crafty --no-pager -l" | head -25
+            pause ;;
+        "Minecraft: Backups")
+            ssh $SSH_Q "$HOME_HOST" "ls -lht /mnt/marco-backups/minecraft | head -10" 2>/dev/null || echo "Could not read the backup folder."
+            pause ;;
+        "Proxmox: Containers and VMs")
+            ssh -t "$HOME_HOST" "sudo pct list; echo; sudo qm list"
+            pause ;;
+        "Power: FULL reboot")     full_reboot; pause ;;
+        "Power: FULL power off")  full_poweroff; pause ;;
+        "To shell")          exit 0 ;;
+        "Quit")
+            # log out: end the shell that started the menu (usually your login shell)
+            if [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = "bash" ]; then
+                kill -HUP "$PPID"
+            fi
+            exit 0 ;;
+    esac
+done

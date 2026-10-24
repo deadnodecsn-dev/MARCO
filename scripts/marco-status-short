@@ -1,0 +1,88 @@
+#!/bin/bash
+# Quick homelab status check: ROOT (local), HOME + NAS (remote), Docker, and network health.
+
+HOME_IP="192.168.1.11"
+NAS_HOST="nas.local"
+PING_COUNT=5
+PING_TIMEOUT=1
+
+echo "=============================="
+echo "     Hello Carson."
+echo "  $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=============================="
+
+# --- ROOT ---
+root_uptime=$(uptime -p 2>/dev/null)
+
+echo
+echo "ROOT"
+echo "Status:     ONLINE"
+echo "Uptime:     ${root_uptime}"
+
+# --- Ping HOME once for the network test; reuse the result for HOME status too ---
+ping_output=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$HOME_IP" 2>/dev/null)
+loss=$(echo "$ping_output" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+[ -z "$loss" ] && loss=100
+
+echo
+echo "HOME"
+if [ "$loss" -eq 100 ]; then
+    echo "Status:     OFFLINE"
+    echo "Uptime:     UNKNOWN"
+else
+    home_uptime=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "carsonb@${HOME_IP}" "uptime -p" 2>/dev/null)
+    echo "Status:     ONLINE"
+    echo "Uptime:     ${home_uptime:-UNKNOWN}"
+fi
+
+# --- NAS: same idea, ping once and reuse ---
+nas_ping=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$NAS_HOST" 2>/dev/null)
+nas_loss=$(echo "$nas_ping" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+[ -z "$nas_loss" ] && nas_loss=100
+
+echo
+echo "NAS"
+if [ "$nas_loss" -eq 100 ]; then
+    echo "Status:     OFFLINE"
+    echo "Uptime:     UNKNOWN"
+else
+    nas_uptime=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "carsonb@${NAS_HOST}" "uptime -p" 2>/dev/null)
+    echo "Status:     ONLINE"
+    echo "Uptime:     ${nas_uptime:-UNKNOWN}"
+fi
+
+# --- Docker on ROOT (local): every container, running or not ---
+echo
+echo "Docker"
+if docker_ps=$(docker ps -a --format '{{.Names}}|{{.State}}' 2>/dev/null); then
+    if [ -z "$docker_ps" ]; then
+        echo "(no containers)"
+    else
+        echo "$docker_ps" | while IFS='|' read -r name state; do
+            if [ "$state" = "running" ]; then
+                printf '%-11s %s\n' "${name}:" "ONLINE"
+            else
+                printf '%-11s %s\n' "${name}:" "OFFLINE"
+            fi
+        done
+    fi
+else
+    echo "Docker:     UNKNOWN"
+fi
+
+# --- Network status, based on packet loss from the pings above ---
+status_for() {
+    awk -v l="$1" 'BEGIN {
+        if (l == 0) print "OK";
+        else if (l == 100) print "DOWN";
+        else print "DEGRADED";
+    }'
+}
+
+echo
+echo "NETWORK"
+echo "ROOT -> HOME: $(status_for "$loss") (${loss}% loss)"
+echo "ROOT -> NAS:  $(status_for "$nas_loss") (${nas_loss}% loss)"
+
+echo
+echo "=============================="

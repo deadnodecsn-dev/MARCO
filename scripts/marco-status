@@ -1,0 +1,183 @@
+#!/bin/bash
+# MARCO full status report: ROOT (local), HOME + NAS (over SSH), Docker, network.
+
+HOME_IP="192.168.1.11"
+NAS_HOST="nas.local"      # NAS gets its IP from DHCP for now; .local name follows it
+NAS_DATA="/srv/nas"             # where the NAS shared storage will be mounted (change if different)
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=3"
+
+echo "=============================="
+echo "       MARCO STATUS           "
+echo "=============================="
+
+echo
+echo "ROOT"
+echo "Hostname:   $(hostname)"
+echo "Status:     ONLINE"
+echo "Uptime:     $(uptime -p)"
+echo "CPU:        $(command -v mpstat >/dev/null 2>&1 && mpstat 1 1 | awk '/Average:/ {printf "%.0f%%\n", 100 - $NF}' || echo "N/A (mpstat not installed)")"
+echo "CPU Temp:   $(awk '{printf "%.1f°C\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp)"
+echo "RAM:        $(free -h | awk '/^Mem:/ {print $3 " / " $2 " used"}')"
+echo "System:     $(df -h / | awk 'NR==2 {print $4 " free"}')"
+echo "MARCO_ROOT: $(df -h /mnt/marco-root | awk 'NR==2 {print $4 " free"}')"
+
+echo
+echo "Docker"
+ docker ps -a --format '{{.Names}}: {{.Status}}' | while IFS= read -r container; do
+    if echo "$container" | grep -q "Up"; then
+        echo "$container" | sed 's/: Up.*/: ONLINE/'
+    else
+        echo "$container" | sed 's/: .*/: OFFLINE/'
+    fi
+done
+
+echo
+echo "HOME"
+if ssh $SSH_OPTS carsonb@$HOME_IP "echo ONLINE" > /dev/null 2>&1; then
+
+    home_data=$(ssh $SSH_OPTS carsonb@$HOME_IP '
+        echo "HOSTNAME|$(hostname)"
+        echo "UPTIME|$(uptime -p)"
+        echo "CPU|$(command -v mpstat >/dev/null 2>&1 && mpstat 1 1 | awk "/Average:/ {printf \"%.0f%%\", 100 - \$NF}" || echo "N/A (mpstat not installed)")"
+        temp_zone=$(for z in /sys/class/thermal/thermal_zone*; do
+            if [ "$(cat "$z/type" 2>/dev/null)" = "x86_pkg_temp" ]; then
+                echo "$z"
+                break
+            fi
+        done)
+        echo "TEMP|$(awk "{printf \"%.1f°C\", \$1/1000}" "$temp_zone/temp" 2>/dev/null || echo "N/A")"
+        echo "RAM|$(free -h | awk "/^Mem:/ {print \$3 \" / \" \$2 \" used\"}")"
+        echo "DISK|$(df -h / | awk "NR==2 {print \$4 \" free\"}")"
+        echo "MARCODATA|$(mountpoint -q /mnt/marco-data && df -h /mnt/marco-data | awk "NR==2 {print \$4 \" free\"}" || echo "not mounted")"
+        echo "STORAGE|$(sudo /usr/local/bin/marco-storage)"
+    ')
+
+    hostname_val=$(echo "$home_data"   | grep "^HOSTNAME|"   | cut -d'|' -f2)
+    uptime_val=$(echo "$home_data"     | grep "^UPTIME|"     | cut -d'|' -f2)
+    cpu_val=$(echo "$home_data"        | grep "^CPU|"        | cut -d'|' -f2)
+    temp_val=$(echo "$home_data"       | grep "^TEMP|"       | cut -d'|' -f2)
+    ram_val=$(echo "$home_data"        | grep "^RAM|"        | cut -d'|' -f2)
+    disk_val=$(echo "$home_data"       | grep "^DISK|"       | cut -d'|' -f2)
+    marcodata_val=$(echo "$home_data"  | grep "^MARCODATA|"  | cut -d'|' -f2)
+    storage_val=$(echo "$home_data"    | grep "^STORAGE|"    | cut -d'|' -f2)
+
+    echo "Hostname:   $hostname_val"
+    echo "Status:     ONLINE"
+    echo "Uptime:     $uptime_val"
+    echo "CPU:        $cpu_val"
+    echo "CPU Temp:   $temp_val"
+    echo "RAM:        $ram_val"
+    echo "System:     $disk_val"
+    echo "MARCO_DATA: $marcodata_val"
+    echo "Storage:    $storage_val"
+    echo "Proxmox:    ONLINE"
+else
+    echo "Hostname:   UNKNOWN"
+    echo "Status:     OFFLINE"
+    echo "Uptime:     UNKNOWN"
+    echo "CPU:        UNKNOWN"
+    echo "CPU Temp:   UNKNOWN"
+    echo "RAM:        UNKNOWN"
+    echo "System:     UNKNOWN"
+    echo "MARCO_DATA: UNKNOWN"
+    echo "Storage:    UNKNOWN"
+    echo "Proxmox:    UNKNOWN"
+fi
+
+echo
+echo "NAS"
+if ssh $SSH_OPTS carsonb@$NAS_HOST "echo ONLINE" > /dev/null 2>&1; then
+
+    nas_data=$(ssh $SSH_OPTS carsonb@$NAS_HOST "NAS_DATA='$NAS_DATA' bash -s" <<'REMOTE'
+        echo "HOSTNAME|$(hostname)"
+        echo "IP|$(hostname -I | awk '{print $1}')"
+        echo "UPTIME|$(uptime -p)"
+        echo "TEMP|$(awk '{printf "%.1f°C", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "N/A")"
+        echo "RAM|$(free -h | awk '/^Mem:/ {print $3 " / " $2 " used"}')"
+        echo "DISK|$(df -h / | awk 'NR==2 {print $4 " free"}')"
+        if mountpoint -q "$NAS_DATA"; then
+            echo "DATA|$(df -h "$NAS_DATA" | awk 'NR==2 {print $4 " free of " $2}')"
+        else
+            echo "DATA|not set up yet"
+        fi
+        if grep -q '^md' /proc/mdstat 2>/dev/null; then
+            if grep -qE 'resync|recovery|reshape' /proc/mdstat; then
+                echo "RAID|REBUILDING ($(grep -oE '[0-9.]+%' /proc/mdstat | head -1))"
+            elif grep -qE '\[U*_+U*\]' /proc/mdstat; then
+                echo "RAID|DEGRADED (a drive is missing or failed)"
+            else
+                echo "RAID|OK ($(grep -oE '\[U+\]' /proc/mdstat | head -1))"
+            fi
+        else
+            echo "RAID|not set up yet"
+        fi
+        for svc in smbd nfs-server; do
+            if systemctl cat "$svc" >/dev/null 2>&1; then
+                if systemctl is-active --quiet "$svc"; then st="ONLINE"; else st="OFFLINE"; fi
+            else
+                st="not installed"
+            fi
+            echo "SVC_$svc|$st"
+        done
+REMOTE
+    )
+
+    get() { echo "$nas_data" | grep "^$1|" | cut -d'|' -f2; }
+
+    echo "Hostname:   $(get HOSTNAME)"
+    echo "Status:     ONLINE"
+    echo "IP:         $(get IP)"
+    echo "Uptime:     $(get UPTIME)"
+    echo "CPU Temp:   $(get TEMP)"
+    echo "RAM:        $(get RAM)"
+    echo "System:     $(get DISK)"
+    echo "Storage:    $(get DATA)"
+    echo "Mirror:     $(get RAID)"
+    echo "Samba:      $(get SVC_smbd)"
+    echo "NFS:        $(get SVC_nfs-server)"
+else
+    echo "Hostname:   UNKNOWN"
+    echo "Status:     OFFLINE"
+    echo "Storage:    UNKNOWN"
+    echo "Mirror:     UNKNOWN"
+    echo "Samba:      UNKNOWN"
+    echo "NFS:        UNKNOWN"
+fi
+
+echo
+echo "NETWORK"
+
+# ping_check HOST -> prints "latency|loss"
+ping_check() {
+    ping -c 4 -W 1 "$1" 2>/dev/null | awk -F'[,/]' '
+    /packet loss/ { loss=$3; sub(/ packet loss/, "", loss) }
+    /rtt/ { latency=$5 }
+    END {
+        if (loss == "") loss="100%"
+        printf "%.2f|%s\n", latency, loss
+    }'
+}
+
+# report LABEL HOST
+report() {
+    result=$(ping_check "$2")
+    latency=$(echo "$result" | cut -d'|' -f1)
+    loss=$(echo "$result" | cut -d'|' -f2)
+    loss_num=$(echo "$loss" | tr -d '% ')
+    if awk -v n="$loss_num" 'BEGIN{exit !(n>=100)}'; then
+        state="DOWN"
+    elif awk -v n="$loss_num" 'BEGIN{exit !(n>0)}'; then
+        state="DEGRADED"
+    else
+        state="OK"
+    fi
+    printf '%-13s %s\n' "$1:" "$state"
+    printf '%-13s %s\n' "  Latency:" "${latency} ms"
+    printf '%-13s %s\n' "  Loss:" "$(echo "$loss" | tr -d ' ')"
+}
+
+report "ROOT -> HOME" "$HOME_IP"
+report "ROOT -> NAS" "$NAS_HOST"
+
+echo
+echo "=============================="

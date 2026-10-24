@@ -1,0 +1,109 @@
+#!/bin/bash
+# marco-kuma-setup: sets up Uptime Kuma on MARCO ROOT from the terminal.
+#
+# What it does:
+#   1. checks that Docker works and nothing is in Kuma's way
+#   2. adds the UFW firewall rule for the web UI (safe to repeat, UFW skips rules that exist)
+#   3. pulls the image and starts the container on the HOST network
+#   4. waits until Kuma reports "healthy"
+# What it does NOT do: add monitors. Kuma has no config file for that, so do it
+# in the web UI (the list is printed at the end).
+#
+# Why the host network: on Docker's own bridge network the Pi-hole DNS check
+# (UDP port 53) timed out, while web checks worked. On the host network Kuma
+# talks to Pi-hole the same way ROOT does, and the UFW rule for 3001 really applies.
+#
+# Safe to run twice. If a container called "uptime-kuma" already exists (for
+# example the Portainer stack), the script keeps it and only checks it.
+
+NAME="uptime-kuma"                  # container name, also what the docker commands use
+IMAGE="louislam/uptime-kuma:2"      # Kuma version 2
+DATA="/mnt/marco-data/uptime-kuma"  # database and settings live here, so reboots and updates keep them
+PORT=3001                           # web UI port (with the host network, Kuma itself listens on it)
+ROOT_IP="192.168.1.10"
+
+say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '\033[32m  OK\033[0m  %s\n' "$*"; }
+warn() { printf '\033[33m  !!\033[0m  %s\n' "$*"; }
+die()  { printf '\033[31m  XX\033[0m  %s\n' "$*"; exit 1; }
+
+# ---- 1/5 Docker works? ----
+say "1/5 Checking Docker"
+docker info >/dev/null 2>&1 || die "Docker is not usable by this user. Run it as carsonb on ROOT."
+ok "Docker works"
+
+# ---- 2/5 Is Kuma already there, or something on its port? ----
+say "2/5 Checking for an existing Kuma"
+if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
+    state=$(docker inspect -f '{{.State.Status}}' "$NAME")
+    mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$NAME")
+    warn "A container named $NAME already exists (state: $state, network: $mode). Not creating another."
+    [ "$mode" = "host" ] || warn "It is not on the host network, so the Pi-hole DNS check may time out. Use network_mode: host in the stack."
+    [ "$state" = "running" ] || docker start "$NAME" >/dev/null
+    EXISTING=1
+else
+    EXISTING=0
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PORT\$"; then
+        die "Port $PORT is already in use by something else. If a Portainer stack named uptime-kuma is stuck, remove that stack first (tick only uptime-kuma)."
+    fi
+    ok "Nothing in the way"
+fi
+
+# ---- 3/5 Firewall ----
+say "3/5 Firewall (UFW)"
+if command -v ufw >/dev/null 2>&1; then
+    sudo -v || die "Need your sudo password for the firewall step."
+    sudo ufw allow from 192.168.1.0/24 to any port "$PORT" proto tcp
+    ok "Rule added (or already there). Check with: sudo ufw status verbose"
+else
+    warn "ufw not found, skipping the firewall rule"
+fi
+
+# ---- 4/5 Start the container ----
+if [ "$EXISTING" = "0" ]; then
+    say "4/5 Pulling the image (a few minutes on the first run)"
+    docker pull "$IMAGE" || die "Pull failed. Check ROOT's internet: ping -c 3 1.1.1.1"
+    ok "Image ready"
+
+    docker run -d \
+        --name "$NAME" \
+        --restart unless-stopped \
+        --network host \
+        -v "$DATA:/app/data" \
+        -e TZ=America/Los_Angeles \
+        "$IMAGE" >/dev/null || die "Could not start the container."
+    ok "Container started"
+else
+    say "4/5 Skipped (container already exists)"
+fi
+
+# ---- 5/5 Wait for healthy ----
+say "5/5 Waiting for Kuma to become healthy (up to 3 minutes)"
+status=""
+for i in $(seq 1 36); do
+    status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$NAME" 2>/dev/null)
+    [ "$status" = "healthy" ] && break
+    printf '.'
+    sleep 5
+done
+echo
+if [ "$status" = "healthy" ]; then
+    ok "Kuma is healthy"
+else
+    warn "Status is '$status'. Check: docker logs --tail 40 $NAME"
+fi
+
+cat <<INNEREOF
+
+Next steps (in the browser):
+  1. Open http://$ROOT_IP:$PORT and create the admin account (SQLite if asked).
+  2. Settings -> Monitor History -> 14 days (the data is on the SD card).
+  3. Add these monitors, interval 60 s, Retries 2:
+       DNS       google.com via resolver $ROOT_IP port 53   (Pi-hole DNS)
+       HTTP      http://$ROOT_IP:8053/admin     (Pi-hole web)
+       HTTP      http://$ROOT_IP:7575           (Homarr)
+       HTTPS     https://$ROOT_IP:9443          (Portainer, ignore TLS errors)
+       HTTPS     https://192.168.1.11:8006    (Proxmox, ignore TLS errors)
+       HTTPS     https://192.168.1.12:8443    (Crafty panel, ignore TLS errors)
+       TCP port  192.168.1.12 port 25565      (MARCOCRAFT)
+INNEREOF

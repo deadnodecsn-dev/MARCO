@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# marco-menu (HOME edition): full-screen launcher for MARCO HOME (Proxmox host).
+# Lives at ~/marco-menu on HOME. Needs fzf:  sudo apt install fzf
+
+# ---- Edit these if addresses change ----
+ROOT_IP="192.168.1.10"        # ROOT
+NAS_IP="192.168.1.13"         # NAS Pi
+MC_IP="192.168.1.12"          # marco-mc container
+GW_IP="192.168.1.1"            # gateway
+MC_CT=100                       # marco-mc container ID
+BACKUPS="/mnt/marco-backups/minecraft"
+
+if ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf is not installed. Run: sudo apt install fzf"
+    exit 1
+fi
+
+# Ctrl+C stops the running command, not the whole menu
+trap ':' INT
+
+pause() { echo; read -rp "Press Enter to return to the menu... " _; }
+
+confirm() {
+    read -rp "$1 Type yes: " ans
+    [ "$ans" = "yes" ]
+}
+
+dot() {
+    if ping -c1 -W1 "$1" >/dev/null 2>&1; then
+        printf '\033[32m●\033[0m'
+    else
+        printf '\033[31m●\033[0m'
+    fi
+}
+
+header() {
+    printf 'HOME \033[32m●\033[0m   ROOT %s   NAS %s   MC %s      Enter = run   Esc = shell   type to search' \
+        "$(dot "$ROOT_IP")" "$(dot "$NAS_IP")" "$(dot "$MC_IP")"
+}
+
+ping_node() {     # $1 = label, $2 = ip
+    avg=$(ping -c3 -W1 "$2" 2>/dev/null | awk -F'/' '/^rtt/ {printf "%.1f ms", $5}')
+    printf '%-9s %-16s %s\n' "$1" "$2" "${avg:-DOWN}"
+}
+
+T=$'\t'
+ENTRIES=$(cat <<EOF
+Monitor: Summary${T}Uptime, load, RAM, CPU temperature and free space on / in one screen.
+Monitor: htop${T}Live CPU, memory and process view. Press q to come back.
+Monitor: Temperatures${T}Every thermal zone. x86_pkg_temp is the real CPU temperature.
+Monitor: Disk space${T}Free space on every real filesystem.
+Monitor: Storage (marco-storage)${T}Runs your marco-storage script for the storage pool.
+Monitor: Recent errors${T}The last 50 error-level log lines. Asks for your sudo password.
+Monitor: Updates available${T}How many packages are waiting for an upgrade. Nothing is installed.
+Proxmox: Containers and VMs${T}pct list and qm list.
+Proxmox: Storage pools${T}pvesm status. Asks for your sudo password.
+Proxmox: Services${T}Are the core Proxmox services (pveproxy, pvedaemon, pve-cluster, pvestatd) running?
+Minecraft: Shell (marco-mc)${T}Open a shell inside the Minecraft container. Type exit to come back.
+Minecraft: Crafty service${T}Is Crafty running inside the Minecraft container?
+Minecraft: Backups${T}The newest Minecraft backups on this machine.
+Minecraft: Backup size${T}How much space the Minecraft backups take.
+Network: IP addresses${T}Every network interface and address on HOME.
+Network: Ping nodes${T}Latency to ROOT, NAS, marco-mc, the gateway and the internet.
+Network: Tailscale status${T}Which machines are on the tailnet and how they connect.
+Network: Tailscale check${T}Is the tailscale0 interface up, what is HOME's Tailscale address, and who is online.
+Network: Firewall status${T}Is the Proxmox firewall on, and what rules are in /etc/pve/firewall/cluster.fw. Asks for your sudo password.
+Network: Dashboard links${T}The Proxmox and Crafty web pages as Tailscale addresses.
+System: Update packages${T}apt update and full-upgrade on HOME. Asks you to type yes first.
+Power: Reboot HOME${T}Reboots this machine. The Minecraft container stops too. Asks first.
+Power: Shut down HOME${T}Powers this machine off. You must press its power button to turn it back on. Asks first.
+To shell${T}Leave the menu and use a normal HOME prompt.
+Quit${T}Leave the menu and log out of HOME (closes this SSH session).
+EOF
+)
+
+while true; do
+    choice=$(printf '%s\n' "$ENTRIES" |
+        fzf --ansi --delimiter="$T" --with-nth=1 \
+            --height=100% --layout=reverse --border=rounded --cycle --no-info \
+            --border-label=' M A R C O   H O M E ' --color='label:bold,border:cyan' \
+            --prompt='HOME > ' --header="$(header)" \
+            --preview='printf "%s\n" {2}' \
+            --preview-window='right,45%,wrap,<90(down,5,wrap)') || exit 0
+
+    label=${choice%%$'\t'*}
+    clear
+
+    case "$label" in
+        "Monitor: Summary")
+            echo "Uptime:   $(uptime -p)"
+            echo "Load:     $(cut -d' ' -f1-3 /proc/loadavg)"
+            free -h | awk '/^Mem:/ {print "RAM:      " $3 " used of " $2}'
+            for z in /sys/class/thermal/thermal_zone*; do
+                if [ "$(cat "$z/type" 2>/dev/null)" = "x86_pkg_temp" ]; then
+                    awk '{printf "CPU temp: %.1f C\n", $1/1000}' "$z/temp"
+                fi
+            done
+            df -h / | awk 'NR==2 {print "Root:     " $4 " free of " $2}'
+            pause ;;
+        "Monitor: htop")
+            if command -v htop >/dev/null 2>&1; then htop; else echo "htop is not installed. Run: sudo apt install htop"; pause; fi ;;
+        "Monitor: Temperatures")
+            for z in /sys/class/thermal/thermal_zone*; do
+                printf '%-14s %s C\n' "$(cat "$z/type" 2>/dev/null)" "$(awk '{printf "%.1f", $1/1000}' "$z/temp" 2>/dev/null)"
+            done
+            pause ;;
+        "Monitor: Disk space")
+            df -h -x tmpfs -x devtmpfs -x squashfs -x overlay; pause ;;
+        "Monitor: Storage (marco-storage)")
+            if command -v marco-storage >/dev/null 2>&1; then sudo -n marco-storage || sudo marco-storage
+            elif [ -x "$HOME/marco-storage" ]; then sudo "$HOME/marco-storage"
+            else echo "marco-storage was not found on HOME's PATH or in ~."; fi
+            pause ;;
+        "Monitor: Recent errors")
+            sudo journalctl -p err -n 50 --no-pager; pause ;;
+        "Monitor: Updates available")
+            n=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
+            echo "$n package(s) can be upgraded."
+            echo "(Counts come from the last 'apt update'. Nothing was installed.)"
+            pause ;;
+        "Proxmox: Containers and VMs")
+            sudo pct list; echo; sudo qm list; pause ;;
+        "Proxmox: Storage pools")
+            sudo pvesm status; pause ;;
+        "Proxmox: Services")
+            for s in pveproxy pvedaemon pve-cluster pvestatd; do
+                printf '%-14s %s\n' "$s" "$(systemctl is-active "$s")"
+            done
+            pause ;;
+        "Minecraft: Shell (marco-mc)")
+            sudo pct enter "$MC_CT" ;;
+        "Minecraft: Crafty service")
+            sudo pct exec "$MC_CT" -- systemctl status crafty --no-pager -l | head -25
+            pause ;;
+        "Minecraft: Backups")
+            ls -lht "$BACKUPS" 2>/dev/null | head -10 || echo "Could not read $BACKUPS"
+            pause ;;
+        "Minecraft: Backup size")
+            du -sh "$BACKUPS" 2>/dev/null || echo "Could not read $BACKUPS"
+            pause ;;
+        "Network: IP addresses")
+            ip -br a; pause ;;
+        "Network: Ping nodes")
+            ping_node ROOT "$ROOT_IP"
+            ping_node NAS "$NAS_IP"
+            ping_node marco-mc "$MC_IP"
+            ping_node gateway "$GW_IP"
+            ping_node internet 1.1.1.1
+            pause ;;
+        "Network: Tailscale status")
+            tailscale status; pause ;;
+        "Network: Tailscale check")
+            ip -br a show tailscale0 2>/dev/null || echo "tailscale0 interface not found"
+            echo
+            echo "Tailscale address: $(tailscale ip -4 2>/dev/null || echo unknown)"
+            echo
+            tailscale status 2>/dev/null | head -8
+            pause ;;
+        "Network: Firewall status")
+            sudo pve-firewall status
+            echo
+            echo "== /etc/pve/firewall/cluster.fw =="
+            sudo cat /etc/pve/firewall/cluster.fw 2>&1
+            echo
+            echo "Safe-change recipe (second SSH session + auto-undo timer): see the MARCO HOME note, Firewall section."
+            pause ;;
+        "Network: Dashboard links")
+            cat <<'LINKS'
+Over Tailscale (works away from home):
+  Proxmox     https://100.64.0.2:8006
+  Crafty      https://100.64.0.3:8443
+LINKS
+            pause ;;
+        "System: Update packages")
+            if confirm "Run apt update and full-upgrade on HOME?"; then
+                sudo apt update && sudo apt full-upgrade
+            else
+                echo "Cancelled."
+            fi
+            pause ;;
+        "Power: Reboot HOME")
+            if confirm "Reboot HOME? Minecraft players will be disconnected and this session will drop."; then
+                sudo reboot
+            else
+                echo "Cancelled."; pause
+            fi ;;
+        "Power: Shut down HOME")
+            if confirm "Shut down HOME? Minecraft goes offline and you must press the power button to turn it back on."; then
+                sudo poweroff
+            else
+                echo "Cancelled."; pause
+            fi ;;
+        "To shell")  exit 0 ;;
+        "Quit")
+            # log out: end the shell that started the menu (usually your login shell)
+            if [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = "bash" ]; then
+                kill -HUP "$PPID"
+            fi
+            exit 0 ;;
+    esac
+done

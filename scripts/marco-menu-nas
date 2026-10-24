@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# marco-menu (NAS edition): full-screen launcher for marco-nas (Raspberry Pi 1, 512 MB).
+# Lives at ~/marco-menu on the NAS. Needs fzf:  sudo apt install fzf
+# Kept light on purpose: nothing here runs in the background.
+
+# ---- Edit these if addresses change ----
+ROOT_IP="192.168.1.10"        # ROOT
+HOME_IP="192.168.1.11"        # HOME
+GW_IP="192.168.1.1"            # gateway
+
+if ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf is not installed. Run: sudo apt install fzf"
+    exit 1
+fi
+
+# Ctrl+C stops the running command, not the whole menu
+trap ':' INT
+
+pause() { echo; read -rp "Press Enter to return to the menu... " _; }
+
+confirm() {
+    read -rp "$1 Type yes: " ans
+    [ "$ans" = "yes" ]
+}
+
+dot() {
+    if ping -c1 -W1 "$1" >/dev/null 2>&1; then
+        printf '\033[32m●\033[0m'
+    else
+        printf '\033[31m●\033[0m'
+    fi
+}
+
+header() {
+    printf 'NAS \033[32m●\033[0m   ROOT %s   HOME %s      Enter = run   Esc = shell   type to search' \
+        "$(dot "$ROOT_IP")" "$(dot "$HOME_IP")"
+}
+
+ping_node() {     # $1 = label, $2 = ip
+    avg=$(ping -c3 -W1 "$2" 2>/dev/null | awk -F'/' '/^rtt/ {printf "%.1f ms", $5}')
+    printf '%-9s %-16s %s\n' "$1" "$2" "${avg:-DOWN}"
+}
+
+svc_state() {     # $1 = service name
+    if systemctl cat "$1" >/dev/null 2>&1; then
+        systemctl is-active "$1"
+    else
+        echo "not installed"
+    fi
+}
+
+T=$'\t'
+ENTRIES=$(cat <<EOF
+Monitor: Summary${T}Uptime, load, RAM, temperature and free space on the SD card in one screen.
+Monitor: htop${T}Live CPU, memory and process view. Press q to come back.
+Monitor: Disk space${T}Free space on every real filesystem.
+Monitor: Updates available${T}How many packages are waiting for an upgrade. Slow on this Pi, give it a moment.
+Monitor: Recent errors${T}The last 50 error-level log lines. Asks for your sudo password.
+Storage: Drives${T}The two USB sticks and what is mounted where (lsblk).
+Storage: Mirror status${T}State of the RAID1 mirror. Says "not set up yet" until it is built.
+Storage: Shares and services${T}Samba and NFS: running, stopped or not installed.
+Storage: NFS${T}NFS state, what is exported, and which machines are connected to it right now.
+Network: IP addresses${T}Every network interface and address on the NAS.
+Network: Ping nodes${T}Latency to ROOT, HOME, the gateway and the internet.
+System: Update packages${T}apt update and full-upgrade on the NAS. Slow on this Pi. Asks you to type yes first.
+Power: Reboot NAS${T}Reboots the NAS. Takes about a minute. Asks first.
+Power: Shut down NAS${T}Safe shutdown. Replug the power to turn it back on. Asks first.
+To shell${T}Leave the menu and use a normal NAS prompt.
+Quit${T}Leave the menu and log out of the NAS (closes this SSH session).
+EOF
+)
+
+while true; do
+    choice=$(printf '%s\n' "$ENTRIES" |
+        fzf --ansi --delimiter="$T" --with-nth=1 \
+            --height=100% --layout=reverse --border=rounded --cycle --no-info \
+            --border-label=' M A R C O   N A S ' --color='label:bold,border:cyan' \
+            --prompt='NAS > ' --header="$(header)" \
+            --preview='printf "%s\n" {2}' \
+            --preview-window='right,45%,wrap,<90(down,5,wrap)') || exit 0
+
+    label=${choice%%$'\t'*}
+    clear
+
+    case "$label" in
+        "Monitor: Summary")
+            echo "Uptime:   $(uptime -p)"
+            echo "Load:     $(cut -d' ' -f1-3 /proc/loadavg)"
+            free -h | awk '/^Mem:/ {print "RAM:      " $3 " used of " $2}'
+            if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+                awk '{printf "CPU temp: %.1f C\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp
+            fi
+            df -h / | awk 'NR==2 {print "SD card:  " $4 " free of " $2}'
+            pause ;;
+        "Monitor: htop")
+            if command -v htop >/dev/null 2>&1; then htop; else echo "htop is not installed. Run: sudo apt install htop"; pause; fi ;;
+        "Monitor: Disk space")
+            df -h -x tmpfs -x devtmpfs -x squashfs; pause ;;
+        "Monitor: Updates available")
+            echo "Checking, this can take a few seconds on this Pi..."
+            n=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
+            echo "$n package(s) can be upgraded."
+            echo "(Counts come from the last 'apt update'. Nothing was installed.)"
+            pause ;;
+        "Monitor: Recent errors")
+            sudo journalctl -p err -n 50 --no-pager; pause ;;
+        "Storage: Drives")
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT; pause ;;
+        "Storage: Mirror status")
+            if grep -q '^md' /proc/mdstat 2>/dev/null; then
+                cat /proc/mdstat
+            else
+                echo "No RAID mirror yet. Mirror: not set up yet."
+            fi
+            pause ;;
+        "Storage: Shares and services")
+            printf '%-14s %s\n' "Samba (smbd)" "$(svc_state smbd)"
+            printf '%-14s %s\n' "NFS" "$(svc_state nfs-server)"
+            pause ;;
+        "Storage: NFS")
+            printf '%-14s %s\n' "NFS (nfs-server)" "$(svc_state nfs-server)"
+            echo
+            echo "== Exports (/etc/exports) =="
+            cat /etc/exports 2>/dev/null || echo "no /etc/exports"
+            echo
+            echo "== Connected NFS clients (port 2049) =="
+            c=$(ss -tn state established '( sport = :2049 )' 2>/dev/null | tail -n +2)
+            if [ -n "$c" ]; then printf '%s\n' "$c"; else echo "none connected right now"; fi
+            pause ;;
+        "Network: IP addresses")
+            ip -br a; pause ;;
+        "Network: Ping nodes")
+            ping_node ROOT "$ROOT_IP"
+            ping_node HOME "$HOME_IP"
+            ping_node gateway "$GW_IP"
+            ping_node internet 1.1.1.1
+            pause ;;
+        "System: Update packages")
+            if confirm "Run apt update and full-upgrade on the NAS? This can take a long time on this Pi."; then
+                sudo apt update && sudo apt full-upgrade
+            else
+                echo "Cancelled."
+            fi
+            pause ;;
+        "Power: Reboot NAS")
+            if confirm "Reboot the NAS? This session will drop."; then
+                sudo reboot
+            else
+                echo "Cancelled."; pause
+            fi ;;
+        "Power: Shut down NAS")
+            if confirm "Shut down the NAS? It stays off until you replug its power."; then
+                sudo poweroff
+            else
+                echo "Cancelled."; pause
+            fi ;;
+        "To shell")  exit 0 ;;
+        "Quit")
+            # log out: end the shell that started the menu (usually your login shell)
+            if [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = "bash" ]; then
+                kill -HUP "$PPID"
+            fi
+            exit 0 ;;
+    esac
+done
